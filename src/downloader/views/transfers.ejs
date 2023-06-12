@@ -1,0 +1,62 @@
+<h2>Transfers Board</h2>
+<table class="table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Status</th>
+      <th>Percentage Downloaded</th>
+    </tr>
+  </thead>
+  <tbody>
+    <% ongoing_downloads.forEach(download=> { %>
+      <tr>
+        <td>
+          <%= download.name %>
+        </td>
+        <td>
+          <%= download.status %>
+        </td>
+        <td>
+          <div class="progress">
+            <div class="progress-bar progress-bar-animated" role="progressbar" id="<%= download.id %>" aria-valuenow="0"
+              aria-valuemin="0" aria-valuemax="100"></div>
+          </div>
+        </td>
+      </tr>
+      <% }) %>
+  </tbody>
+</table>
+<script>
+  function updateProgressBars() {
+    // Make an Ajax request to the backend server
+    $.ajax({
+      type: "GET",
+      url: '/progress',
+      data: {},
+      success: function (data) {
+        var filesprogress = data.values;
+        var isupdated = false;
+        filesprogress.forEach(function (file) {
+          var progress = file.progress;
+          var id = file.id;
+          var progressbar = $('#' + id);
+          if (!progressbar)
+            return;
+          var currentvalue = progressbar.attr('aria-valuenow');
+          /*if (currentvalue == progress)
+            return;*/
+          progressbar.css('width', progress + '%');
+          progressbar.attr('aria-valuenow', progress);
+          progressbar.text(progress + '%');
+          isupdated = true;
+        });
+        //if (isupdated)
+        setTimeout(updateProgressBars, 500);
+      }
+    });
+  }
+  // Start updating progress bars on page load
+  window.onload = () => {
+    updateProgressBars();
+  }
+</script>
