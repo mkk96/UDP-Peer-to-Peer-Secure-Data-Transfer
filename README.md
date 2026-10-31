@@ -1,105 +1,179 @@
-# UDP Peer to Peer Secure Data Transfer
-## Tasks
-| Task | Date Started | Date Completed | Notes | PRs | Issue |
-| -------- | ------- | ----------|-----|-----|-------- |
-| Repo Creation | 05-02-2022 | 05-02-2022 | | | |
-| Requirement Doc | 06-02-2022 | 09-02-2022 | | | |
+# Peer-to-Peer Secure Data Transfer
+
+Encrypted, chunked, parallel file transfer between two Node.js agents, coordinated and logged by a central Data Foundation (DFS) server.
+
+![Node.js](https://img.shields.io/badge/Node.js-339933?style=flat-square&logo=nodedotjs&logoColor=white)
+![Express](https://img.shields.io/badge/Express-000000?style=flat-square&logo=express&logoColor=white)
+![Socket.IO](https://img.shields.io/badge/Socket.IO-010101?style=flat-square&logo=socketdotio&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white)
+![Jest](https://img.shields.io/badge/tested%20with-Jest-C21325?style=flat-square&logo=jest&logoColor=white)
 
 ## Overview
 
-This project aims to implement secure, high-speed peer-to-peer data transfer between two agents (Data Foundation and Partner) using NodeJS servers. The transfer uses UDP for data transfer and TCP for transfer quality control. The project involves creating Data Transfer Profiles for each agent, which include details such as IP addresses, host names, and port details. The data transfer is initiated by setting up a transfer request with parameters such as number of threads, IP addresses, and schedule time. The project includes a web-based monitoring system to monitor the data transfer session. Additionally, the project involves integrating the Data Foundation with the file system and MinIO.
+The project lets two institutions ("agents") exchange large files directly with each other. A central **DFS server** handles discovery, request routing and an audit log, but it never carries file data.
 
-**Use cases for this platform include**:
+- **Agent app** (`src/downloader`): an Express + EJS web app. The same codebase runs as the sender (port `3000`) and as the receiver (port `3001`). It splits files into parts, streams them to the peer encrypted with AES-256-CBC, and reassembles them on the other side. A worker pool downloads parts in parallel.
+- **DFS server** (`src/dfs-server`): an Express service on port `4000`. It keeps the directory of agents (`users.csv`), passes transfer requests from sender to receiver, resolves agent addresses, and logs every event with Winston. It also has a small monitoring UI that shows the transfer history.
 
-- Educational: The platform could be used in educational institutions for transferring large amounts of data, such as video lectures or research papers, between teachers and students or between different departments within the same institution.
-- Research: Researchers can use the platform to transfer large amounts of data, such as scientific data or simulations, between different research institutions or between researchers working on the same project.
-- Industry: Companies could use the platform for secure, high-speed transfer of large amounts of data, such as financial data or customer data, between different departments within the company or between different companies.
-- Community building: The platform could be used to transfer large amounts of data, such as event videos or community resources, between different communities or between members within a community.
-- Competition: The platform could be used for secure, high-speed data transfer during competitions, such as programming competitions, where large amounts of data, such as code submissions or testing data, need to be transferred quickly and securely between participants and organizers.
+The original design (see `docs/` and the diagrams below) called for UDP for data and TCP for quality control. **The current implementation streams parts over Socket.IO (WebSocket/TCP)**, which is why the repository keeps its original "UDP" name.
+
+## How it works
+
+1. **Login.** The agent fetches the list of registered agents from the DFS server (`POST /login`, which returns bcrypt-hashed passwords) and authenticates the user locally with Passport.
+2. **Upload request.** On the sender, the user browses the local file system, picks a file, enters the receiver's ID and a shared secret key, and submits.
+3. **Partitioning.** The sender splits the file into parts of `PART_SIZE` (64 MB by default) under `tmp/<uuid>/` and records the transfer in its SQLite database.
+4. **Routing.** The sender posts the transfer metadata to the DFS server (`/sender_request`). The DFS server looks up the receiver's address in `users.csv` and forwards the request to the receiver (`/dfs_request`).
+5. **Accept or reject.** The request appears on the receiver's **Requests** page. The receiver's decision is reported back to the DFS server (`/accept_download`) and logged.
+6. **Parallel download.** After accepting, the receiver gets the sender's address from the DFS server (`/get_address`). Worker threads then each open a Socket.IO connection to the sender and request one part (`request_part`). The sender streams the part through an AES-256-CBC cipher keyed with the shared secret, and the receiver decrypts it as it arrives.
+7. **Merge.** When every part has arrived, the receiver merges them into `downloads/<filename>` and marks the transfer `COMPLETED`. Progress for each part is stored in SQLite, and the UI polls it.
+
+### Original system design
+
+![Workflow overview](README_ASSETS/Images/workflow1.png)
+
+![Transfer sequence](README_ASSETS/Images/workflow2.png)
+
+## Features
+
+- Web dashboard for each agent: configure, upload, incoming requests, ongoing transfers and completed downloads.
+- Server-side directory browser for picking the file to send.
+- Chunked transfer with parts streamed in parallel through a `workerpool` of threads.
+- AES-256-CBC encryption of every part in transit, using a per-transfer secret key.
+- Transfer state (status, parts received, progress) kept in SQLite via Sequelize, one database file per agent port.
+- Accept/reject flow for incoming transfers, routed through the DFS server.
+- DFS server audit log (Winston, JSON lines in `server.log`) with a **History** page showing the latest events.
+- Jest + Supertest test suites for both services.
+
+## Tech stack
+
+| Area | Technology |
+| --- | --- |
+| Runtime | Node.js |
+| Web | Express, EJS (`express-ejs-layouts`), Bootstrap, jQuery |
+| Auth | Passport (local strategy), bcrypt, express-session |
+| Transfer | Socket.IO, socket.io-stream, workerpool |
+| Crypto | Node.js `crypto` (AES-256-CBC) |
+| Storage | SQLite via Sequelize; CSV agent registry |
+| Logging | Winston |
+| Testing | Jest, Supertest |
+
+## Project structure
+
+```
+UDP-Peer-to-Peer-Secure-Data-Transfer/
+├── src/
+│   ├── dfs-server/                # Central coordination + monitoring server (port 4000)
+│   │   ├── app.js                 # Routes: /login, /sender_request, /get_address, /accept_download, /history
+│   │   ├── users.csv              # Agent registry: id, password, name, key, address
+│   │   ├── views/                 # Monitoring UI (index, history, current)
+│   │   └── test/dfs.test.js
+│   └── downloader/                # Agent app (sender on 3000, receiver on 3001)
+│       ├── server.js              # Web UI, transfer orchestration, Socket.IO part server
+│       ├── workers/streamWorker.js    # Worker: fetch + decrypt one part
+│       ├── controllers/streamHandler.js  # Split file into parts / merge parts
+│       ├── config/default.json    # PART_SIZE, TEMP_DIR, DOWNLOAD_DIR, workers, DFS_SERVER
+│       ├── views/                 # Dashboard, upload, requests, transfers, downloads
+│       └── tests/server.test.js
+├── docs/                          # Project report (PDF) and presentation (PPTX)
+└── README_ASSETS/Images/          # Design diagrams
+```
+
+## Getting started
+
+### Prerequisites
+
+- **Node.js 18 or 20.** The code uses `crypto.createCipher` / `createDecipher`, which were removed in Node.js 22.
+- npm
+- Build tools for the native `bcrypt` and `sqlite3` modules, if no prebuilt binaries exist for your platform.
+
+### Install
+
+```bash
+git clone https://github.com/mkk96/UDP-Peer-to-Peer-Secure-Data-Transfer.git
+cd UDP-Peer-to-Peer-Secure-Data-Transfer
+
+cd src/dfs-server && npm install
+cd ../downloader  && npm install
+```
+
+### Configure
+
+- `src/dfs-server/users.csv` lists each agent's ID, password and `ip_address` (`host:port`). The defaults point to `localhost:3000` and `localhost:3001`.
+- `src/downloader/config/default.json`: set `DFS_SERVER` to the DFS server's `host:port` (default `localhost:4000`). You can also tune `PART_SIZE`, `TEMP_DIR`, `DOWNLOAD_DIR` and the worker counts here.
+
+### Run (three terminals)
+
+```bash
+# 1. DFS server: http://localhost:4000
+cd src/dfs-server
+npm run devstart          # or: node app.js
+
+# 2. Sender agent: http://localhost:3000
+cd src/downloader
+npm run senderStart       # or: node server.js 3000
+
+# 3. Receiver agent: http://localhost:3001
+cd src/downloader
+npm run receiverStart     # or: node server.js 3001
+```
+
+Start each agent from inside `src/downloader`. The config, worker script and SQLite files are resolved relative to the working directory.
+
+### Test
+
+```bash
+cd src/dfs-server && npm test
+cd src/downloader && npm test
+```
+
+## Usage
+
+1. Open the sender at `http://localhost:3000/login` and sign in with one of the agent accounts defined in `users.csv`.
+2. Open the receiver at `http://localhost:3001/login` and sign in with the other account.
+3. On the sender, go to **Upload**, browse to a file, and enter the receiver's agent ID and a secret key.
+4. On the receiver, open **Requests** and **Accept** the incoming transfer.
+5. Watch progress under **Transfers**. The finished file appears under **Downloads** and in `src/downloader/downloads/`.
+6. Open the DFS server at `http://localhost:4000` and click **History** to see the logged events.
+
+## API reference
+
+### DFS server (`:4000`)
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/` | Monitoring home |
+| `GET` | `/history` | Last 20 log events, newest first |
+| `GET` | `/current` | Placeholder ("Work in Progress") |
+| `POST` | `/login` | Returns the agent list with bcrypt-hashed passwords |
+| `POST` | `/sender_request` | `{ uuid, filename, size, parts, sender_id, receiver_id, secret_key }`. Forwards the request to the receiver |
+| `POST` | `/get_address` | `{ id }`. Returns the agent's `ip_address` |
+| `POST` | `/accept_download` | Logs the receiver's accept/reject decision |
+
+### Agent (`:3000` / `:3001`)
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` / `POST` | `/login` | Login page / Passport authentication |
+| `GET` | `/upload`, `/dir?path=` | Upload page and directory listing |
+| `POST` | `/upload` | Partition a file and send the transfer request to the DFS server |
+| `POST` | `/dfs_request` | Incoming transfer request (called by the DFS server) |
+| `GET` | `/requests`, `/transfers`, `/downloads` | Incoming requests, active transfers, completed files |
+| `POST` | `/accept`, `/reject` | Respond to an incoming request |
+| `GET` | `/progress` | JSON progress for active transfers |
+| Socket.IO | `request_part` → `part` | Stream one encrypted part to a receiver |
+
+## Limitations and future work
+
+- Data travels over Socket.IO (TCP). The UDP data channel from the original design is not implemented.
+- The design's per-chunk MD5 verification with NACK-based retransmission and its MinIO integration are not implemented.
+- The secret key is typed by the sender and passed to the receiver through the DFS server. There is no public-key exchange.
+- `crypto.createCipher` derives the key and IV from the password without a salt. A production version should switch to `createCipheriv` with a proper key derivation function.
+- Agent accounts are kept in a CSV file, and the session secret is hard-coded. Both are fine for a demo but not for deployment.
+
+## Context
+
+Team project for **CS4.409 Data Foundation Systems** at IIIT Hyderabad (M.Tech, 2023), built by Soumodipta Bose, Vishal Pawar and Mukul Kumar. The full requirements, design and report are in `docs/`.
 
 ---
 
-## Requirements
-
-
-UDP Peer to Peer Secure Data Transfer
-- Secure high speed peer to peer data transfer from/to Data Foundation Server
-- Data Transfer between two Agents (Data Foundation and Partner ) with the help of NodeJS servers
-    - UDP for data transfer
-    - TCP for transfer quality control
-- Data Foundation and Partner Data Tansfer Profile detail:
-    - Data Foundation Agent(s) Details: Partner ID, Partner Public Key, Partner Private Key, Data Send / Receive directory, Host name, IP Address, port details
-    - Partner Agent(s) Details: Partner ID, Partner Public Key, Partner Private Key, Data Send / Receive directory, Host name, IP Address, port details
-- Data Transfer Request Setup ( Sender and Receiver DT Profiles, Transfer Configuration: (#threads, IP addresses, ports, schedule time, # of files, Total Files Size, md key)
-- Add Files
-- Schedule/Initiate Data Transfer Request
-- DT Profile key verification. On success, Initiate Data transfer (send / receive)
-- Data Transfer Session Monitor ( Web based monitoring)
-- Data Foundation Integration: File System Integration + MinIO Integration
-
-## Technical Requirements
-
-### Software Requirements
-The project will mostly be based on Node js. The parsing, validation, uploading, and
-downloading of the data will be handled with dedicated Node js objects or modules.
-The UI section of the project will be based on javascript, in particular , react js, which enables us to create a suitable reactJS web application allowing client-side users to easily upload and download files. JSon file can be used to keep track of the necessary configurations of the file transfer system.
-
---- 
-
-### Hardware Requirements
-We will require three systems. One will be acting as client uploading the file.The other will be acting as a monitoring system at the DFS Server for tracking and monitoring data transfer. Another for acting as client downloading the file. Systems should have capable enough processor as applications can handle information at a faster speed. (preferably with 4 core or more). A high speed internet connection will be needed.
-
-## Scope
-- Using NodeJS servers, two agents (Data Foundation and Partner) can exchange data at rapid speeds between each other while being secure.
-- Data Transfer Session Monitor ( Web based monitoring)
-- Data Foundation Integration: File System Integration + MinIO Integration
-
-## System Design 
-<center>
-    
-![](README_ASSETS/Images/workflow1.png)
-
-</center>
-
-### **Workflow of the System**
-
-The traditional mode of file transmission involves multiple steps and can be time-consuming. To address this issue, our team has developed a point-to-point transfer mode that enables end-to-end file transmission between users in a single step. Here's how it works:
-
-#### Preqrequisites for setup:
-1. Create Participant ID for each client node.
-2. Generate Public and Private Keys for each user and store on the database of DFS Server.
-3. Each client has to set their profile details's that is participant ID and download directory. ( They should have enough space for downloading the entire file)
-
----
-- Step 1. Agent A logs into the website(fetches its own Public and Private key) and navigates to the "Point-to-Point" transfer page and clicks "Start to Transfer File" and enters the recipient's ID. This initiates a Handshake with Agent B through the DFS Server and creates a request to the DFS server to find the recipient's ID.
-
-- Step 2. The server searches for the recipient's information (Public and Private Key) and provides Agent A with the recipient's ID and Key. Agent A then prepares the transfer request along with the decryption key(A's public key) from the database and sends it to the recipient.
-
-- Step 3. Agent B receives the transfer request and verifies it. Upon successful verification, Agent B sends a confirmation to the server.
-
-- Step 4. The server receives the confirmation from Agent B and informs Agent A, who can now initiate the transfer.
-
-- Step 5.  Agent A breaks down the file into chunks and creates parallel threads to send each chunk encrypted with A's private key. The receiver that is Agent B recieves each chunk on parallel threads and decrypts using A's public key. We will use MD5 to verify integrity of each file chunk, if corrupted send a Negative Acknowledgement to resend the chunk.
-
-- Step 6. The server monitors the upload and download progress of the transfer and provides real-time updates from Agent A and Agent B.
-
-- Step 7. Once the transfer is complete, the recipient can open the local directory and view the received file. The server also updates the transfer history, which can be accessed by both parties to view the status of previous transfers.
-
-By adding a server that monitors the transfer process, both parties can view the progress of the transfer in real-time and have access to all transfer history in one centralized location. This added level of transparency and accountability helps to ensure that all transfers are completed successfully and provides a convenient way to track transfer history.
-<center>
-    
-![](README_ASSETS/Images/workflow2.png)
-
-</center>
-
-### Instructions to run test suite :
-* Install all dependencies using `npm install`
-* Go to `src/dfs-server` and type `npm test`
-* Go to `src/downloader` and type `npm test`
-
-### Instructions to run system:
-* First setup configuration files in dfs-server with sender  and reciever ip address.
-* Setup dfs-server's ip address in `/config/default.json` in sender and reciever.
-* Run the dfs server using `npm run devStart`
-* Run sender side :`npm senderStart 3000`
-* Run reciever side :`npm recieverStart 3001`
+Made by [Mukul Kumar](https://mkk96.github.io) · [GitHub](https://github.com/mkk96) · [LinkedIn](https://www.linkedin.com/in/mukul-kumar-60322616b/)
